@@ -1,0 +1,539 @@
+from experiments_runner import (
+    setup_cluster_and_aiopslab,
+    cleanup_cluster,
+    load_fault_scenarios,
+    load_agent_configurations,
+)
+from experiments_runner.automated_datagraph import update_datagraph_for_scenario
+
+import asyncio
+import datetime
+import json
+import logging
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+from dotenv import load_dotenv
+
+from utils import TelegramNotification, get_today_model_usage
+from config import apply_config_overrides, MAX_DAILY_OPENAI_TOKEN_LIMIT, AIOPSLAB_DIR, TRACE_SERVICE_STARTING_POINT
+from evaluation import evaluate_experiment
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("mcp.client.streamable_http").setLevel(logging.WARNING)
+
+logger = logging.getLogger("automated_experiment")
+
+
+def get_experiment_dir_path(dir_name: str, experiment_path: Optional[str] = None):
+    """
+    返回实验结果目录路径。
+    Creates the directory if it does not exist.
+
+    参数：
+        dir_name: 实验批次目录名
+        experiment_path: 自定义结果根路径，默认读取 RESULTS_PATH
+
+    返回：
+        Path: 实验目录路径对象
+    """
+    if experiment_path:
+        output_dir = experiment_path
+    else:
+        output_dir = os.environ.get("RESULTS_PATH", "results")
+    output_dir_path = Path(output_dir)
+
+    if not output_dir_path.is_absolute():
+        output_dir_path = Path.cwd() / output_dir_path
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # 创建实验子目录
+    experiment_dir_path = output_dir_path / dir_name
+    experiment_dir_path.mkdir(parents=True, exist_ok=True)
+
+    return experiment_dir_path
+
+async def run_experiment(
+    agent_id: str,
+    fault_scenario: dict,
+    agent_configuration_name: str,
+    run_sre_agent_func,
+    export_json_results_func,
+    evaluation_func,
+    batch_name: str,
+    results_group_dir: Optional[Path] = None,
+    prompts_config: Optional[dict[str,str]] = None,
+    run_index: int = 0,
+    total_runs: int = 1
+) -> tuple[dict, Path]:
+    
+    fault_name = fault_scenario.get("fault_type", "")
+    app_name = fault_scenario.get("scenario", "")
+    app_summary = fault_scenario.get("app_summary", "")
+    target_namespace = fault_scenario.get("target_namespace", "")
+    trace_service_starting_point = fault_scenario.get("service_starting_point", "") or TRACE_SERVICE_STARTING_POINT
+    wait_time_before_running_agent = int(fault_scenario.get("wait_before_launch_agent", 60))
+
+    logger.info(
+        "等待 %s 秒后启动 RCA Agent",
+        wait_time_before_running_agent,
+    )
+    time.sleep(wait_time_before_running_agent)
+
+    experiment_name = f"{agent_configuration_name} - {app_name} - {fault_name} ({batch_name})"
+    logger.info("启动实验：%s", experiment_name)
+
+    result, exec_time = await run_sre_agent_func(
+        app_name=app_name,
+        fault_name=fault_name,
+        app_summary=app_summary,
+        target_namespace=target_namespace,
+        trace_service_starting_point=trace_service_starting_point,
+        trace_name=experiment_name,
+        agent_configuration_name=agent_configuration_name,
+        agent_id=agent_id,
+        prompts_config=prompts_config
+    )
+
+    logger.info("等待 15 秒以便 LangSmith 同步最终实验数据后再保存结果...")
+    time.sleep(15)
+
+    # 保存结果
+    date_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    safe_experiment_name = experiment_name.replace(" ", "-")
+    # 仅在存在多次运行时添加索引前缀
+    if total_runs > 1:
+        output_file = f"{run_index}_{date_str}_{safe_experiment_name}.json"
+    else:
+        output_file = f"{date_str}_{safe_experiment_name}.json"
+
+    enriched_result = export_json_results_func(
+        result=result,
+        experiment_name=experiment_name,
+        exec_time = exec_time,
+        fault_name=fault_name,
+        application_name=app_name,
+        target_namespace=target_namespace,
+        trace_service_starting_point=trace_service_starting_point,
+        agent_configuration_name=agent_configuration_name,
+        agent_id=agent_id
+    )
+
+    if results_group_dir is not None:
+        output_dir_path = results_group_dir
+    else:
+        output_dir = os.environ.get("RESULTS_PATH", "results")
+        output_dir_path = Path(output_dir)
+        if not output_dir_path.is_absolute():
+            output_dir_path = Path.cwd() / output_dir_path
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    output_file_path = output_dir_path / output_file
+
+    enriched_result["evaluation"] = evaluate_experiment(fault_scenario,enriched_result)
+
+    with open(output_file_path, "w") as f:
+        json.dump(enriched_result, f, indent=2, default=str)
+
+    logger.info("Results saved to %s", output_file_path)
+    logger.info("Experiment completed successfully")
+
+    return enriched_result, output_file_path
+
+def main():
+
+    ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+    load_dotenv(dotenv_path=ENV_PATH)
+
+    AIOPSLAB_DIR = "/home/vm-kubernetes/AIOpsLab"
+
+    # 获取故障场景
+    fault_scenarios = load_fault_scenarios()
+
+    # 获取 agent 配置
+    agents_configurations = load_agent_configurations()
+    
+    # 按 agent id 对配置排序
+    agents_configurations = sorted(agents_configurations, key=lambda x: x.get("id", ""))
+
+    if not fault_scenarios:
+        logger.error("No fault scenarios found. Exiting.")
+        return
+    
+    if not agents_configurations:
+        logger.error("No agent configurations found. Exiting.")
+        return
+
+    # 结合每个配置的运行次数，计算总运行数
+    total_runs = sum(len(fault_scenarios) * agent.get("runs", 1) for agent in agents_configurations)
+    print(f"\n\nThe following experiments will be executed ({total_runs} experiments):")
+    for scenario_idx, scenario in enumerate(fault_scenarios, start=1):
+        for config_idx, agent in enumerate(agents_configurations, start=1):
+            agent_id = agent.get("id", "Unknown ID")
+            scenario_name = scenario.get("scenario", "Unknown Scenario")
+            fault_type = scenario.get("fault_type", "Unknown Fault")
+            agent_conf_name = agent.get("name", "Unknown Agent Configuration")
+            num_runs = agent.get("runs", 1)
+            runs_suffix = f" ({num_runs} runs)" if num_runs > 1 else ""
+            print(f"{scenario_idx}{agent_id}. {agent_conf_name} - {scenario_name} — {fault_type}{runs_suffix}")
+
+    proceed_input = input("\nProceed with these experiments? [y/N]: ").strip().lower()
+    if proceed_input not in {"y", "yes"}:
+        logger.info("Aborting execution at user request.")
+        return
+
+    default_batch_name = datetime.datetime.now().strftime("batch-%Y%m%d-%H%M%S")
+    batch_dir_input = input(
+        f"Enter directory name for this experiment batch [{default_batch_name}]: "
+    ).strip()
+    batch_dir_name = batch_dir_input or default_batch_name
+
+    enable_notifications = False
+    telegram_notifier: TelegramNotification | None = None
+    telegram_handler: logging.Handler | None = None
+    telegram_choice = input("Enable Telegram notifications? [y/N]: ").strip().lower()
+    if telegram_choice in {"y", "yes"}:
+        telegram_notifier = TelegramNotification()
+        try:
+            telegram_handler = telegram_notifier.create_log_handler()
+            telegram_handler.setLevel(logging.ERROR)
+            formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+            telegram_handler.setFormatter(formatter)
+            logging.getLogger().addHandler(telegram_handler)
+
+            telegram_notifier.send_telegram_message(
+                f"✅ Telegram notifications enabled for SRE automated experiments ({batch_dir_name})"
+            )
+            enable_notifications = True
+        except RuntimeError as exc:
+            logger.error("Telegram notifications disabled: %s", exc)
+            telegram_notifier = None
+        except Exception as exc:
+            logger.error("初始化 Telegram 通知失败：%s", exc)
+            if telegram_handler:
+                logging.getLogger().removeHandler(telegram_handler)
+            telegram_notifier = None
+
+    results_group_path = get_experiment_dir_path(batch_dir_name, None)
+    logger.info("Results will be stored under: %s", results_group_path)
+
+    total_scenarios = len(fault_scenarios)
+    total_configs = len(agents_configurations)
+
+    for scenario_idx, scenario in enumerate(fault_scenarios, start=1):
+        
+        # 使用场景配置覆盖 TARGET_NAMESPACE 环境变量
+        target_namespace = scenario.get("target_namespace", "")
+        if target_namespace:
+            logger.info("Setting TARGET_NAMESPACE env var from scenario: %s", target_namespace)
+            os.environ["TARGET_NAMESPACE"] = target_namespace
+
+        # 使用场景配置覆盖环境变量
+        env_variables = scenario.get("env_variables", {})
+        if env_variables:
+            logger.info("从场景配置加载环境变量覆盖项：")
+            for key, value in env_variables.items():
+                logger.info("  - Setting %s = %s", key, value)
+                os.environ[key] = str(value)
+        else:
+            logger.info("No environment variable overrides specified in scenario config")
+
+        if enable_notifications and telegram_notifier:
+            try:
+                telegram_notifier.send_telegram_message(
+                    f"🚀 Starting scenario {scenario_idx}/{total_scenarios}: {scenario.get('scenario', 'Unknown Scenario')} - {scenario.get('fault_type', 'Unknown fault type')}"
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("发送 Telegram 启动消息失败：%s", exc)
+
+        pre_run_usage = get_today_model_usage(model_name="gpt-5-mini")
+        logger.info(
+            "Current token usage (gpt-5-mini) before scenario %d: input=%d, output=%d, total=%d",
+            scenario_idx,
+            pre_run_usage["input_tokens"],
+            pre_run_usage["output_tokens"],
+            pre_run_usage["total_tokens"],
+        )
+        if pre_run_usage["total_tokens"] >= MAX_DAILY_OPENAI_TOKEN_LIMIT:
+            logger.error(f"Token usage exceeded limit {MAX_DAILY_OPENAI_TOKEN_LIMIT}. Aborting experiment.")
+            if enable_notifications and telegram_notifier:
+                try:
+                    telegram_notifier.send_telegram_message(
+                        "❌ Experiment aborted: token usage exceeded budget."
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("发送 Telegram 中止消息失败：%s", exc)
+            sys.exit(1)
+
+        logger.info("========= Scenario %d/%d =========", scenario_idx, total_scenarios)
+        logger.info("Scenario: %s", scenario.get("scenario", "Unknown Scenario"))
+        logger.info("Fault: %s", scenario.get("fault_type", "Unknown Fault"))
+
+        cluster_setup_successful = False
+        try:
+            # 第 1 步：为当前场景更新 datagraph
+            logger.info("=== STEP 1: Update Datagraph ===")
+            scenario_name = scenario.get("scenario", "")
+            if scenario_name:
+                update_datagraph_for_scenario(scenario_name)
+            else:
+                logger.warning("No scenario name found, skipping datagraph update")
+
+            # 第 2 步：搭建集群并启动 AIOpsLab
+            logger.info("=== STEP 2: Setup kind and aiopslab ===")
+
+            success = setup_cluster_and_aiopslab(
+                problem_id=scenario["aiopslab_command"],
+                aiopslab_dir=AIOPSLAB_DIR,
+                stream_cli_output=True,
+            )
+
+            if not success:
+                logger.error("Setup failed for scenario '%s'; cleaning up cluster before moving to next scenario", scenario.get("scenario", "Unknown Scenario"))
+                
+                # 即使搭建失败，也尝试清理集群
+                try:
+                    cleanup_cluster()
+                    logger.info("Cluster cleanup completed after setup failure")
+                except Exception as cleanup_error:
+                    logger.error("初始化失败后的清理出错：%s", cleanup_error)
+                
+                if enable_notifications and telegram_notifier:
+                    try:
+                        telegram_notifier.send_telegram_message(
+                            f"❌ Setup failed for scenario '{scenario.get('scenario', 'Unknown Scenario')}'. Cluster cleaned up. Skipping to next scenario."
+                        )
+                    except Exception as exc:
+                        logger.warning("发送 Telegram 初始化失败消息失败：%s", exc)
+                continue
+            
+            cluster_setup_successful = True
+
+            # 在搭建完成后、启动事件循环前再导入
+            from launch_experiment import run_sre_agent, export_json_results
+
+            # 第 3 步：运行实验（为异步执行创建新的事件循环）
+
+            logger.info("=== 步骤 3：运行 K8s Datagraph RCA ===")
+
+            for config_idx, agent_conf in enumerate(agents_configurations, start=1):
+                agent_name = agent_conf.get("name", "Unknown Agent Configuration")
+                agent_id = agent_conf.get("id", "Unknown ID")
+                prompts_config = agent_conf.get("prompts_config", {})
+                formatted_agent_name = f"{agent_id} - {agent_name}"
+                
+                # 获取该 agent 配置的运行次数（默认 1）
+                num_runs = agent_conf.get("runs", 1)
+                
+                logger.info(
+                    "Running agent configuration %s (%d/%d) for scenario '%s': %s (%d run(s))",
+                    agent_id,
+                    config_idx,
+                    total_configs,
+                    scenario.get("scenario", "Unknown Scenario"),
+                    agent_name,
+                    num_runs,
+                )
+
+                # 若存在多次运行，则创建 agent 专属结果目录
+                agent_results_dir = results_group_path
+                if num_runs > 1:
+                    agent_result_dir_name = f"{agent_id} - {scenario.get('scenario', 'Unknown Scenario')} - {scenario.get('fault_type', 'Unknown Fault')}"
+                    agent_results_dir = results_group_path / agent_result_dir_name
+                    agent_results_dir.mkdir(parents=True, exist_ok=True)
+                    logger.info("Created agent-specific results directory: %s", agent_results_dir)
+
+                # 针对多次运行进行循环
+                for run_num in range(0, num_runs):
+                    if num_runs > 1:
+                        logger.info("========= Run %d/%d =========", run_num + 1, num_runs)
+                    
+                    experiment_label = f"{formatted_agent_name} - {scenario.get('app_name', scenario.get('scenario', 'Unknown App'))} - {scenario.get('fault_type', 'Unknown Fault')}"
+                    
+                    if num_runs > 1:
+                        experiment_label += f" (Run {run_num + 1}/{num_runs})"
+                    
+                    if enable_notifications and telegram_notifier:
+                        try:
+                            telegram_notifier.send_telegram_message(
+                                f"🧪 Starting experiment '{experiment_label}' ({agent_id})"
+                            )
+                        except Exception as exc:  # pragma: no cover
+                            logger.warning("发送 Telegram 实验启动消息失败：%s", exc)
+
+                    overrides_to_log = {
+                        key: agent_conf[key]
+                        for key in ("MAX_TOOL_CALLS", "RCA_TASKS_PER_ITERATION")
+                        if key in agent_conf
+                    }
+
+                    if overrides_to_log:
+                        logger.info("Applying overrides: %s", overrides_to_log)
+                    else:
+                        logger.info("No overrides specified; using existing runtime settings.")
+
+                    apply_config_overrides(agent_conf)
+
+                    usage = get_today_model_usage(model_name="gpt-5-mini")
+
+                    logger.info(
+                        "Current token usage (gpt-5-mini) before run: input=%d, output=%d, total=%d",
+                        usage["input_tokens"],
+                        usage["output_tokens"],
+                        usage["total_tokens"],
+                    )
+                    if usage["total_tokens"] >= MAX_DAILY_OPENAI_TOKEN_LIMIT:
+                        logger.error(f"Token usage exceeded limit ({MAX_DAILY_OPENAI_TOKEN_LIMIT}). Aborting experiment.")
+                        if enable_notifications and telegram_notifier:
+                            try:
+                                telegram_notifier.send_telegram_message(
+                                    "❌ Experiment aborted mid-run: token usage exceeded budget."
+                                )
+                            except Exception as exc:  # pragma: no cover
+                                logger.warning("发送 Telegram 预算预警失败：%s", exc)
+                        sys.exit(1)
+
+                    enriched_result, output_file_path = asyncio.run(
+                        run_experiment(
+                            agent_id = agent_id,
+                            fault_scenario=scenario,
+                            agent_configuration_name=formatted_agent_name,
+                            batch_name=batch_dir_name,
+                            run_sre_agent_func=run_sre_agent,
+                            export_json_results_func=export_json_results,
+                            evaluation_func=evaluate_experiment,
+                            results_group_dir=agent_results_dir,
+                            prompts_config=prompts_config,
+                            run_index=run_num,
+                            total_runs=num_runs
+                        )
+                    )
+
+                    logger.info(
+                        "Completed agent configuration %s run %d/%d for scenario '%s'",
+                        agent_id,
+                        run_num + 1,
+                        num_runs,
+                        scenario.get("scenario", "Unknown Scenario"),
+                    )
+
+                    if enable_notifications and telegram_notifier:
+                        try:
+                            final_report = enriched_result.get("final_report", {}) if isinstance(enriched_result, dict) else {}
+                            root_cause = final_report.get("root_cause", "Unknown root cause")
+                            detection = final_report.get("detection", False)
+                            localization = final_report.get("localization", [])
+                            stats = enriched_result.get("stats", {}) if isinstance(enriched_result, dict) else {}
+                            total_tokens = stats.get("total_tokens", "N/A")
+                            exec_seconds = stats.get("execution_time_seconds", "N/A")
+                            langsmith_url = stats.get("langsmith_url", "N/A")
+                            
+                            # 安全格式化数值字段
+                            exec_seconds_str = str(int(round(exec_seconds))) if isinstance(exec_seconds, (int, float)) else str(exec_seconds)
+                            total_tokens_str = str(int(round(total_tokens))) if isinstance(total_tokens, (int, float)) else str(total_tokens)
+                            
+                            # 格式化 localization 字段（排序；若为空则给出说明）
+                            if localization:
+                                localization_str = ", ".join(sorted(localization))
+                            else:
+                                localization_str = "No problems detected" if not detection else "Unable to localize"
+                            
+                            telegram_notifier.send_telegram_message(
+                                "\n".join(
+                                    [
+                                        f"✅ Experiment '{enriched_result.get('experiment_name', experiment_label)}' completed.",
+                                        f"Detection: {'✅ Yes' if detection else '❌ No'}",
+                                        f"Localization: {localization_str}",
+                                        f"Root cause: {root_cause}",
+                                        f"Execution time: {exec_seconds_str} seconds",
+                                        f"Total tokens: {total_tokens_str}",
+                                        f"LangSmith run: {langsmith_url}",
+                                    ]
+                                )
+                            )
+                        except Exception as exc:  # pragma: no cover
+                            logger.warning("发送 Telegram 实验完成消息失败：%s", exc)
+
+                    logger.info("Pausing briefly before launching the next experiment...")
+                    time.sleep(10)
+
+            logger.info(
+                "All %d agent configurations executed for scenario '%s' without recreating the cluster",
+                total_configs,
+                scenario.get("scenario", "Unknown Scenario"),
+            )
+
+            if enable_notifications and telegram_notifier:
+                try:
+                    telegram_notifier.send_telegram_message(
+                        f"✅ Scenario '{scenario.get('scenario', 'Unknown Scenario')} - {scenario.get('fault_type', 'Unknown fault type')}' completed."
+                    )
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("发送 Telegram 完成消息失败：%s", exc)
+
+        except KeyboardInterrupt:
+            logger.warning("Interrupted by user (Ctrl+C); performing cleanup")
+            if enable_notifications and telegram_notifier:
+                try:
+                    telegram_notifier.send_telegram_message("⚠️ Experiment interrupted by user (Ctrl+C).")
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("发送 Telegram 中断消息失败：%s", exc)
+            raise  # Re-raise to be handled by outer exception handler
+        
+        except Exception as e:
+            logger.exception("Experiment execution failed for scenario '%s': %s", scenario.get("scenario", "Unknown Scenario"), e)
+            if enable_notifications and telegram_notifier:
+                try:
+                    telegram_notifier.send_telegram_message(
+                        f"❌ Experiment error in scenario '{scenario.get('scenario', 'Unknown Scenario')}': {e}"
+                    )
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("发送 Telegram 异常消息失败：%s", exc)
+            # 不退出程序，清理后直接跳到下一个场景
+        
+        finally:
+            # 第 4 步：清理（每轮场景结束时都会执行）
+            logger.info("=== STEP 4: Cleanup ===")
+            try:
+                # 清理集群（MCP server 的清理由 MultiServerMCPClient 自动处理）
+                # 无论搭建是否成功都执行，确保清除任何残留的部分集群
+                cleanup_cluster()
+                logger.info("Cluster cleanup completed successfully")
+            except Exception as cleanup_error:
+                logger.error("集群清理出错：%s", cleanup_error)
+                if enable_notifications and telegram_notifier:
+                    try:
+                        telegram_notifier.send_telegram_message(
+                            f"⚠️ Cleanup error for scenario '{scenario.get('scenario', 'Unknown Scenario')}': {cleanup_error}"
+                        )
+                    except Exception as exc:
+                        logger.warning("发送 Telegram 清理错误消息失败：%s", exc)
+            
+            logger.info("Pausing briefly before launching the next scenario...")
+            time.sleep(10)
+
+    if enable_notifications and telegram_notifier:
+        try:
+            telegram_notifier.send_telegram_message("🎉 Automated experiment batch completed successfully.")
+        except Exception as exc:  # pragma: no cover
+            logger.warning("发送 Telegram 最终消息失败：%s", exc)
+
+    if telegram_handler:
+        logging.getLogger().removeHandler(telegram_handler)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.warning("\n\nExperiment batch interrupted by user (Ctrl+C). Exiting.")
+        sys.exit(130)
+    except Exception as e:
+        logger.exception("Fatal error in experiment batch: %s", e)
+        sys.exit(1)
